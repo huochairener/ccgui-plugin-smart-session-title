@@ -4,3 +4,5 @@ main.check.mjs
 node_modules/
 dist/
 *.log
+smoke*.mjs
+pending-index/
