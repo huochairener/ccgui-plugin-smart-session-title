@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="智能会话命名">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b1740"/>
+      <stop offset="0.55" stop-color="#241a52"/>
+      <stop offset="1" stop-color="#0f1030"/>
+    </linearGradient>
+    <linearGradient id="tag" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8b7cf7"/>
+      <stop offset="1" stop-color="#4f46e5"/>
+    </linearGradient>
+    <linearGradient id="txt" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#c4b5fd"/>
+      <stop offset="1" stop-color="#a5b4fc"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fde68a"/>
+      <stop offset="1" stop-color="#f59e0b"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <circle cx="404" cy="96" r="150" fill="#7c6cf7" opacity="0.14"/>
+
+  <!-- 会话气泡（标题载体） -->
+  <g>
+    <rect x="72" y="132" width="368" height="212" rx="56" fill="url(#tag)"/>
+    <path d="M148 340 L148 412 L220 344 Z" fill="url(#tag)"/>
+  </g>
+
+  <!-- emoji 前缀：圆角方块里的笑脸 -->
+  <g>
+    <rect x="112" y="192" width="92" height="92" rx="26" fill="#fbbf24"/>
+    <circle cx="141" cy="222" r="8" fill="#3b2a06"/>
+    <circle cx="175" cy="222" r="8" fill="#3b2a06"/>
+    <path d="M136 248 Q158 268 180 248" stroke="#3b2a06" stroke-width="11" stroke-linecap="round" fill="none"/>
+  </g>
+
+  <!-- 标题文字行 -->
+  <g fill="url(#txt)">
+    <rect x="228" y="204" width="172" height="24" rx="12"/>
+    <rect x="228" y="248" width="112" height="24" rx="12" opacity="0.62"/>
+  </g>
+
+  <!-- 自动命名的星芒 -->
+  <g fill="url(#spark)">
+    <path d="M404 356 L416 392 L452 404 L416 416 L404 452 L392 416 L356 404 L392 392 Z"/>
+    <circle cx="454" cy="352" r="12" opacity="0.85"/>
+    <circle cx="352" cy="450" r="9" opacity="0.6"/>
+  </g>
+</svg>
