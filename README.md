@@ -23,15 +23,18 @@ CC GUI 插件：每轮对话结束后，自动为会话生成一个**带 emoji �
 | 引擎 | 参数 | 官方语义 |
 |---|---|---|
 | pi / omp | `--no-session` | `Don't save session (ephemeral)` |
-| claude / codebuddy | `-p` + `--no-session-persistence` | `sessions stay in memory and are not saved to disk`（需配合 `--print`） |
+| claude | `-p` + `--no-session-persistence` | `Disable session persistence - sessions will not be saved to disk and cannot be resumed (only works with --print)` |
+| codebuddy | `-p` + `--no-session-persistence` | `Disable session persistence - sessions stay in memory and are not saved to disk` |
 | codex | `exec --ephemeral` | `Run without persisting session files to disk` |
 
 另外 claude/codebuddy 还带 `--output-format text`，pi/omp 额外带
 `--no-tools --no-extensions --no-skills --thinking off`，codex 带 `--sandbox read-only
 --skip-git-repo-check`——命名只需要一段文本输出，不需要工具、扩展与工作区上下文。
 
-> 这些参数均来自本机已安装 CLI 的帮助文本与二进制内字串核对（不是凭记忆写的）。
-> 旧版 CLI 不认识参数时会直接报错退出 → 插件记日志并退回本地规则，**不会退化成污染侧栏**。
+> 这些参数均来自本机已安装 CLI 的帮助文本与二进制/源码内字串核对（不是凭记忆写的），
+> pi 还追到了实现：`createSessionManager()` 命中 `noSession` 时直接返回
+> `SessionManager.inMemory(cwd)`，不创建会话文件。旧版 CLI 不认识参数时会直接报错退出 →
+> 插件记日志并退回本地规则，**不会退化成污染侧栏**。
 
 ## 状态反馈（右下角状态栏）
 
