@@ -1,0 +1,6 @@
+# 本地开发辅助产物，不进发布仓库
+main.check.mjs
+.ccgui/
+node_modules/
+dist/
+*.log

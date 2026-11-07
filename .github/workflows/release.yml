@@ -1,0 +1,48 @@
+# 发版流水线（市场规范：tag = manifest version，无 v 前缀）。
+# 推送 x.y.z tag 触发：校验 manifest → 校验 tag 与版本一致 → 生成 checksums → 发 Release 附件。
+# 本插件为免构建的单文件 ESM（main.js 即产物），故直接附仓库根文件。
+name: release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check tag matches manifest version
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./manifest.json').version")"
+          if [ "$VERSION" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::manifest version ($VERSION) != tag (${GITHUB_REF_NAME})"
+            exit 1
+          fi
+          echo "version $VERSION"
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          FILES="main.js manifest.json"
+          [ -f styles.css ] && FILES="$FILES styles.css"
+          sha256sum $FILES > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release with plugin artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            main.js
+            manifest.json
+            checksums.txt
