@@ -1,7 +1,7 @@
 {
   "id": "smart-session-title",
   "name": "智能会话命名",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "minAppVersion": "1.1.0",
   "sdkVersion": "^0.3.14",
   "author": "huochairener",
