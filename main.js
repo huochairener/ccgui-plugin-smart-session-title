@@ -1,5 +1,5 @@
 // ============================================================
-// smart-session-title —— 智能会话命名（CC GUI 插件）v0.4.1
+// smart-session-title —— 智能会话命名（CC GUI 插件）v0.4.2
 //
 // 触发：事件总线 usage://updated / usage://done（每轮对话的用量事件），
 //       按会话防抖 8s 合并一轮内的事件（与官方 auto-title 相同的触发模式）。
@@ -31,10 +31,17 @@ export default function activate(ctx) {
     lang: 'auto',  // 'auto' | 'zh' | 'en'
     maxLen: 18,    // 标题最大长度（字，不含 emoji 前缀）
     emoji: true,   // 标题前加一个贴合主题的 emoji
+    think: 'auto', // 'auto' | 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+                   // auto = 不传思考等级参数，由引擎/模型自己决定（旧版默认行为是 off）
   };
 
   const DEBOUNCE_MS = 8000;    // usage 事件防抖（对齐官方 auto-title）
-  const AI_TIMEOUT_MS = 90000; // AI 命名单次超时（直调 CLI 含进程冷启动，比宿主内轮次慢）
+  // AI 命名单次超时。这个值同时是宿主对子进程的 kill 期限（plugin_exec_run 的
+  // timeoutMs 到点后宿主终止进程），所以它直接决定「最坏情况下一个 CLI 进程挂多久」，
+  // 不能按「进程冷启动很慢」放宽：命名有本地规则兜底，2 分钟不出结果不如早点放弃。
+  const AI_TIMEOUT_MS = 30000;
+  const READ_TIMEOUT_MS = 15000;  // 读库：本地 sqlite，正常几十毫秒
+  const WRITE_TIMEOUT_MS = 10000; // 写库：本地 sqlite
   const READ_RETRY = 3;        // 读库重试（索引滞后）
   const READ_RETRY_DELAY_MS = 2500;
   const WRITE_RETRY = 2;
@@ -42,6 +49,7 @@ export default function activate(ctx) {
   const NAMED_LIMIT = 800;
   const MAX_CONCURRENT = 2;
   const QUEUE_LIMIT = 8;
+  const DEBOUNCE_LIMIT = 64;   // 防抖表容量上限（正常只会有个位数会话在等）
   const FLASH_MS = 6000;
   const LOG_MAX = 300;
 
@@ -122,7 +130,10 @@ function run(p) {
 
   const listeners = new Set();
   const timers = new Set();
-  const debounceTimers = new Map(); // key -> timer id
+  // 所有仍在宿主侧运行、尚未返回的 plugin_exec_run（键是调用 id）。
+  // dispose 时逐个 kill，避免热重载/禁用后子进程留在后台。
+  const liveCalls = new Set();
+  const debounceTimers = new Map(); // key -> timer id（LRU：先删最早的 key）
   const queuedKeys = new Set();
   const inflightKeys = new Set();
   const queue = [];          // { engine, sessionId, manual }
@@ -138,6 +149,25 @@ function run(p) {
     return id;
   }
   function removeTimer(id) { clearTimeout(id); timers.delete(id); }
+
+  // 防抖表的插入/读取都走这里，保证 Map 的迭代顺序 = 最近使用顺序，
+  // 超过 DEBOUNCE_LIMIT 就淘汰最早的一条（已结束的会话不会长期占着条目）。
+  function setDebounce(key, id) {
+    debounceTimers.delete(key);
+    debounceTimers.set(key, id);
+    while (debounceTimers.size > DEBOUNCE_LIMIT) {
+      const oldest = debounceTimers.keys().next();
+      if (oldest.done) break;
+      const oldId = debounceTimers.get(oldest.value);
+      debounceTimers.delete(oldest.value);
+      if (oldId) removeTimer(oldId);
+    }
+  }
+  function clearDebounce(key) {
+    const id = debounceTimers.get(key);
+    if (id) removeTimer(id);
+    debounceTimers.delete(key);
+  }
   function sleep(ms) { return new Promise((resolve) => { addTimer(resolve, ms); }); }
 
   /* ---------- 调试日志（documentStorage，可在磁盘上直接查看） ---------- */
@@ -209,6 +239,7 @@ function run(p) {
     if (raw.lang === 'auto' || raw.lang === 'zh' || raw.lang === 'en') c.lang = raw.lang;
     c.maxLen = clampInt(raw.maxLen, 8, 60, DEFAULT_CONFIG.maxLen);
     if (typeof raw.emoji === 'boolean') c.emoji = raw.emoji;
+    if (THINK_LEVELS.indexOf(raw.think) >= 0) c.think = raw.think;
     return c;
   }
 
@@ -231,7 +262,8 @@ function run(p) {
       logPath = loc && loc.path ? loc.path : null;
     } catch (_) {}
     log('已启动 mode=' + config.mode + ' engine=' + (config.engine || '(跟随会话)') +
-        ' model=' + (config.model || '(默认)') + ' 命名记录=' + Object.keys(named).length +
+        ' model=' + (config.model || '(默认)') + ' think=' + config.think +
+        ' 命名记录=' + Object.keys(named).length +
         (logPath ? ' 日志=' + logPath : ''));
     notify();
   }
@@ -260,6 +292,45 @@ function run(p) {
     }
   }
 
+  /* ---------- plugin_exec_run 包装（跟踪 in-flight 调用，停用时能 kill） ----------
+     宿主 plugin_exec_run 的 timeoutMs 到点后除了让本次 IPC 返回，还会 terminate 子进程
+     （plugin_exec_kill 也能杀）；但插件侧必须保证：(1) 超时值本身设得够短，否则「超时」
+     等于「进程会一直跑到 timeoutMs 才死」；(2) 停用/热重载时主动 kill 仍在跑的调用，
+     否则旧实例的 CLI 进程（pi/claude/codex）没人回收，会和宿主进程一起堆在后台。 */
+
+  let callSeq = 0;
+
+  async function execRun(bin, args, timeoutMs) {
+    const id = ++callSeq;
+    liveCalls.add(id);
+    try {
+      return await ctx.bridge.invoke('plugin_exec_run', { bin, args, timeoutMs });
+    } finally {
+      liveCalls.delete(id);
+    }
+  }
+
+  // 停用时杀掉本插件所有 lifecycle="plugin" 的子进程（需任意 exec: 授权）。
+  // 尽力而为：老宿主/SDK 没有这条命令时只记日志，不影响卸载流程。
+  function killLiveProcesses(reason) {
+    const n = liveCalls.size;
+    liveCalls.clear();
+    if (!n) return;
+    try {
+      const p = ctx.bridge.invoke('plugin_exec_kill', {});
+      if (p && typeof p.then === 'function') {
+        p.then((r) => {
+          log('停用：' + reason + '，中止 ' + n + ' 个在跑调用（宿主已杀 ' +
+              (r && typeof r.killed === 'number' ? r.killed : '?') + '）');
+        }, (err) => {
+          log('停用：' + reason + '，中止 ' + n + ' 个在跑调用（kill 失败 ' + errMsg(err) + '）');
+        });
+      }
+    } catch (err) {
+      log('停用：' + reason + '，中止 ' + n + ' 个在跑调用（kill 不可用 ' + errMsg(err) + '）');
+    }
+  }
+
   /* ---------- node 工作脚本调用（payload 内嵌，零 argv 依赖） ---------- */
 
   async function worker(payload, timeoutMs) {
@@ -267,9 +338,7 @@ function run(p) {
     const t0 = Date.now();
     let res;
     try {
-      res = await ctx.bridge.invoke('plugin_exec_run', {
-        bin: 'node', args: ['-e', script], timeoutMs: timeoutMs || 20000,
-      });
+      res = await execRun('node', ['-e', script], timeoutMs || READ_TIMEOUT_MS);
     } catch (err) {
       log('exec 拒绝(' + payload.cmd + ') ' + errMsg(err));
       throw new Error('无法运行 node（' + errMsg(err) + '）');
@@ -444,23 +513,55 @@ function run(p) {
      可用，Codex 只读规划限 macOS），其余引擎根本起不来。
      直调 CLI 一次解决两件事：官方不落盘参数保证零残留，且多引擎都能真走模型。 */
 
-  const NO_TOOLS = ['--print', '--no-session', '--no-tools', '--no-extensions', '--no-skills', '--thinking', 'off'];
+  const NO_TOOLS = ['--print', '--no-session', '--no-tools', '--no-extensions', '--no-skills'];
+
+  /* 思考强度：不是所有模型都能「关思考」。经网关/代理的推理模型（如商汤小浣熊）收到
+     thinking=off / 不带推理参数时会被上游安全策略直接 400（safety check failed），
+     用户侧只看到「AI 失败，本地规则兜底」。所以这里把等级做成配置项，默认 auto =
+     不传参数（交给引擎与模型），需要更强/更省时再显式选。 */
+  const THINK_LEVELS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+  const THINK_LABELS = {
+    auto: '自动（不传参数，跟随引擎/模型）',
+    off: 'off（显式关闭思考）',
+    minimal: 'minimal', low: 'low', medium: 'medium',
+    high: 'high', xhigh: 'xhigh（更高）', max: 'max（最高）',
+  };
+  // 各引擎原生的思考等级取值（pi/omp 用 --thinking <level>，claude 用 --effort <level>）
+  const THINK_FLAG = {
+    pi: { flag: '--thinking', levels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] },
+    omp: { flag: '--thinking', levels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] },
+    claude: { flag: '--effort', levels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  };
+
+  // 把配置里的 think 转成 CLI 参数；auto → []（一个都不传）
+  function thinkArgs(engine, think) {
+    const spec = THINK_FLAG[engine];
+    const lv = THINK_LEVELS.indexOf(think) > 0 ? think : 'auto';
+    if (!spec || lv === 'auto') return [];
+    if (spec.levels.indexOf(lv) < 0) {
+      log('引擎 ' + engine + ' 不支持思考等级 ' + lv + '（可选 ' + spec.levels.join('/') + '），本次不传');
+      return [];
+    }
+    return [spec.flag, lv];
+  }
 
   const NAME_BACKENDS = {
     // pi / omp：--no-session = ephemeral，会话不写盘
     pi: {
-      bin: 'pi', defaultModel: '',
-      args: (prompt, model) => NO_TOOLS.concat(model ? ['--model', model] : []).concat(prompt),
+      bin: 'pi', defaultModel: '', think: true,
+      args: (prompt, model, think) => NO_TOOLS.concat(thinkArgs('pi', think))
+        .concat(model ? ['--model', model] : []).concat(prompt),
     },
     omp: {
-      bin: 'omp', defaultModel: '',
-      args: (prompt, model) => NO_TOOLS.concat(model ? ['--model', model] : []).concat(prompt),
+      bin: 'omp', defaultModel: '', think: true,
+      args: (prompt, model, think) => NO_TOOLS.concat(thinkArgs('omp', think))
+        .concat(model ? ['--model', model] : []).concat(prompt),
     },
     // claude / codebuddy：--no-session-persistence 需配合 --print，会话只留内存
     claude: {
-      bin: 'claude', defaultModel: 'haiku',
-      args: (prompt, model) => ['-p', prompt, '--output-format', 'text', '--no-session-persistence']
-        .concat(model ? ['--model', model] : []),
+      bin: 'claude', defaultModel: 'haiku', think: true,
+      args: (prompt, model, think) => ['-p', prompt, '--output-format', 'text', '--no-session-persistence']
+        .concat(thinkArgs('claude', think)).concat(model ? ['--model', model] : []),
     },
     codebuddy: {
       bin: 'codebuddy', defaultModel: '',
@@ -517,6 +618,7 @@ function run(p) {
     }
 
     const useModel = (config.model || '').trim() || backend.defaultModel;
+    const useThink = THINK_LEVELS.indexOf(config.think) >= 0 ? config.think : DEFAULT_CONFIG.think;
     const maxLen = clampInt(config.maxLen, 8, 60, DEFAULT_CONFIG.maxLen);
     const langText = config.lang === 'zh' ? '中文'
       : config.lang === 'en' ? 'English'
@@ -548,9 +650,7 @@ function run(p) {
     const t0 = Date.now();
     let res;
     try {
-      res = await ctx.bridge.invoke('plugin_exec_run', {
-        bin: backend.bin, args: backend.args(prompt, useModel), timeoutMs: AI_TIMEOUT_MS,
-      });
+      res = await execRun(backend.bin, backend.args(prompt, useModel, useThink), AI_TIMEOUT_MS);
     } catch (err) {
       log('命名 CLI 被拒 ' + backend.bin + '：' + errMsg(err));
       return { title: '', error: '无法运行 ' + backend.bin + '（' + errMsg(err) + '）' };
@@ -569,7 +669,9 @@ function run(p) {
     const raw = pickTitleLine(stdout);
     const title = cleanTitle(raw, maxLen);
     const error = title ? '' : (raw ? '模型输出无法用作标题' : '模型未返回内容');
-    log('AI 命名 ' + useEngine + (useModel ? '/' + useModel : '') + '（' + (Date.now() - t0) + 'ms）→ ' +
+    log('AI 命名 ' + useEngine + (useModel ? '/' + useModel : '') +
+        (backend.think ? ' think=' + useThink : '') +
+        '（' + (Date.now() - t0) + 'ms）→ ' +
         (title ? '"' + title + '"' : '失败: ' + error + ' 原文=' + clipText(raw, 60)));
     return { title, error };
   }
@@ -602,19 +704,24 @@ function run(p) {
     if (disposed) return;
     while (activeJobs < MAX_CONCURRENT && queue.length > 0) {
       const job = queue.shift();
-      queuedKeys.delete(job.engine + '/' + job.sessionId);
+      const key = job.engine + '/' + job.sessionId;
+      queuedKeys.delete(key);
       activeJobs++;
+      // 入队到真正开始之间，会话可能已被手动改名或已在别处跑完；再查一次，
+      // 否则在函数里提前 return 时 key 会留在 inflightKeys 里变成「永远在跑」。
+      if (named[key]) { activeJobs--; continue; }
+      inflightKeys.add(key);
       notify();
       runNaming(job.engine, job.sessionId, job.manual)
         .then(() => {
           activeJobs--;
-          inflightKeys.delete(job.engine + '/' + job.sessionId);
+          inflightKeys.delete(key);
           notify();
           pump();
         })
         .catch((err) => {
           activeJobs--;
-          inflightKeys.delete(job.engine + '/' + job.sessionId);
+          inflightKeys.delete(key);
           fail(err, '命名 ' + job.engine + '/' + shortId(job.sessionId));
           notify();
           pump();
@@ -625,13 +732,12 @@ function run(p) {
   async function runNaming(engine, sessionId, manual) {
     if (disposed) return;
     const key = engine + '/' + sessionId;
-    inflightKeys.add(key);
 
     // 1) 读会话（索引可能滞后，重试）
     let info = null;
     for (let attempt = 0; attempt < READ_RETRY && !disposed; attempt++) {
       if (attempt > 0) await sleep(READ_RETRY_DELAY_MS);
-      const r = await worker({ cmd: 'read', engine, sessionId }, 20000);
+      const r = await worker({ cmd: 'read', engine, sessionId }, READ_TIMEOUT_MS);
       if (r.exists) {
         info = r;
         if (info.firstUser || info.messageCount > 0) break;
@@ -676,7 +782,7 @@ function run(p) {
     for (let attempt = 0; attempt < WRITE_RETRY && !disposed; attempt++) {
       if (attempt > 0) await sleep(WRITE_RETRY_DELAY_MS);
       try {
-        const w = await worker({ cmd: 'write', engine, sessionId, title }, 15000);
+        const w = await worker({ cmd: 'write', engine, sessionId, title }, WRITE_TIMEOUT_MS);
         if (w.updated === 0) { log('写入命中 0 行（会话行已消失）'); return; }
         written = w;
         break;
@@ -705,14 +811,14 @@ function run(p) {
     if (named[key] || inflightKeys.has(key) || queuedKeys.has(key)) return;
 
     const prev = debounceTimers.get(key);
-    if (prev) removeTimer(prev);
+    if (prev) clearDebounce(key);
     const id = addTimer(() => {
       debounceTimers.delete(key);
       if (disposed || config.mode === 'off') return;
       if (named[key]) return;
       enqueue(e.engine, e.sessionId, false);
     }, DEBOUNCE_MS);
-    debounceTimers.set(key, id);
+    setDebounce(key, id);
   }
 
   const disposeUpdated = ctx.events.on('usage://updated', onUsageEvent);
@@ -772,7 +878,7 @@ function run(p) {
     run: (target) => {
       if (!target || !target.engine || !target.sessionId) return;
       const key = target.engine + '/' + target.sessionId;
-      worker({ cmd: 'clear', engine: target.engine, sessionId: target.sessionId }, 15000)
+      worker({ cmd: 'clear', engine: target.engine, sessionId: target.sessionId }, WRITE_TIMEOUT_MS)
         .then(() => { forgetNamed(key); return ctx.sessions.refresh(); })
         .then(() => { clearError(); setFlash('已恢复默认标题', false); })
         .catch((err) => fail(err, '恢复默认标题'));
@@ -786,7 +892,7 @@ function run(p) {
     title: () => '智能命名：为最近的会话重新起名',
     keywords: () => ['title', 'rename', '命名', '起名', '标题'],
     run: () => {
-      worker({ cmd: 'recent' }, 15000)
+      worker({ cmd: 'recent' }, READ_TIMEOUT_MS)
         .then((r) => {
           if (r.session) {
             log('命令触发：最近会话 ' + r.session.engine + '/' + shortId(r.session.sessionId));
@@ -919,6 +1025,26 @@ function run(p) {
       h('div', { style: hintStyle }, '想让命名更便宜/更快时，可指定轻量模型（须与命名引擎匹配）')
     );
 
+    const thinkRow = h('div', null,
+      h('div', { style: rowStyle },
+        h('span', { style: labelStyle }, '思考强度'),
+        h('select', {
+          style: inputStyle,
+          value: config.think,
+          onChange: (e) => setCfg({ think: e.target.value }),
+        },
+          THINK_LEVELS.map((lv) => h('option', { value: lv, key: lv }, THINK_LABELS[lv]))
+        ),
+        h('span', { style: hintStyle }, 'auto 不传参数（推荐）；部分模型必须带思考强度，否则上游会 400（如 safety check failed）')
+      ),
+      h('div', { style: hintStyle }, (engineDraft === null ? config.engine : engineDraft) === 'claude'
+        ? 'claude 只认 low/medium/high/xhigh/max，选 off/minimal 时不会传参数'
+        : (engineDraft === null ? config.engine : engineDraft) === 'codebuddy' ||
+          (engineDraft === null ? config.engine : engineDraft) === 'codex'
+          ? '当前引擎没有思考强度参数，这一项只在 pi / omp / claude 上生效'
+          : 'pi / omp 支持 off–max 全档；claude 支持 low–max。引擎无此参数时自动忽略')
+    );
+
     const langRow = h('div', { style: rowStyle },
       h('span', { style: labelStyle }, '标题语言'),
       h('select', {
@@ -999,6 +1125,7 @@ function run(p) {
       modeSeg,
       showAiRows ? engineRow : null,
       showAiRows ? modelRow : null,
+      showAiRows ? thinkRow : null,
       showAiRows ? langRow : null,
       emojiRow,
       lenRow,
@@ -1021,6 +1148,8 @@ function run(p) {
 
   return () => {
     disposed = true;
+    // 先让宿主杀掉仍在跑的 CLI（否则热重载后旧的 pi/claude/codex 进程无人回收）
+    killLiveProcesses('插件停用');
     for (const id of Array.from(timers)) clearTimeout(id);
     timers.clear();
     queue.length = 0;

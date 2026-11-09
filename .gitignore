@@ -6,3 +6,6 @@ dist/
 *.log
 smoke*.mjs
 pending-index/
+
+# 与本插件无关的本地目录（crosspet 是另一个项目）
+crosspet/

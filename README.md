@@ -28,8 +28,12 @@ CC GUI 插件：每轮对话结束后，自动为会话生成一个**带 emoji �
 | codex | `exec --ephemeral` | `Run without persisting session files to disk` |
 
 另外 claude/codebuddy 还带 `--output-format text`，pi/omp 额外带
-`--no-tools --no-extensions --no-skills --thinking off`，codex 带 `--sandbox read-only
+`--no-tools --no-extensions --no-skills`，codex 带 `--sandbox read-only
 --skip-git-repo-check`——命名只需要一段文本输出，不需要工具、扩展与工作区上下文。
+
+**思考强度**单独由设置项控制（默认不传参数）：pi/omp 用 `--thinking <level>`、claude 用
+`--effort <level>`。老版本固定传 `--thinking off`，经网关/代理的推理模型（如商汤小浣熊）
+会直接 `400 safety check failed`，用户只看到「AI 失败，本地规则兜底」——所以改成可配。
 
 > 这些参数均来自本机已安装 CLI 的帮助文本与二进制/源码内字串核对（不是凭记忆写的），
 > pi 还追到了实现：`createSessionManager()` 命中 `noSession` 时直接返回
@@ -74,6 +78,9 @@ CLI 侧没有通用的「从文件读 prompt」通道（只有 codex 有 `--prom
   - 标题 emoji：开启 / 关闭（只影响之后的命名；emoji 不计入最大长度）
   - 命名引擎：留空 = 跟随会话引擎；可固定 pi / omp / claude / codebuddy / codex
   - 命名模型：留空 = 引擎默认模型（claude 缺省用 haiku，命名不需要大模型）
+  - 思考强度：自动（不传参数，默认）/ off / minimal / low / medium / high / xhigh / max。
+    pi、omp、claude 生效（claude 只认 low–max）；codebuddy、codex 无此参数自动忽略。
+    部分模型必须带思考强度，否则上游会 400（如 `safety check failed`）——遇到就选一档显式等级
   - 标题语言 / 最大长度（8–60 字，不含 emoji 前缀）
   - **「测试完整链路」**：检查 node 与数据库，并为最近会话实际触发一次命名
   - 底部实时显示调试日志与最近错误
