@@ -1,5 +1,6 @@
 # 发版流水线（市场规范：tag = manifest version，无 v 前缀）。
-# 推送 x.y.z tag 触发：校验 manifest → 校验 tag 与版本一致 → 生成 checksums → 发 Release 附件。
+# 推送 x.y.z tag 触发：校验 manifest → 校验 tag 与版本一致 → 跑测试 → 生成 checksums → 发 Release 附件。
+# 测试依赖 node:sqlite（Node >= 22.5），故 node-version 不能低于 22。
 # 本插件为免构建的单文件 ESM（main.js 即产物），故直接附仓库根文件。
 name: release
 
@@ -19,7 +20,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Check tag matches manifest version
         run: |
@@ -30,6 +31,9 @@ jobs:
             exit 1
           fi
           echo "version $VERSION"
+
+      - name: Test
+        run: npm test
 
       - name: Generate checksums
         run: |

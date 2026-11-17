@@ -1,5 +1,5 @@
 // ============================================================
-// smart-session-title —— 智能会话命名（CC GUI 插件）v0.4.2
+// smart-session-title —— 智能会话命名（CC GUI 插件）v0.4.3
 //
 // 触发：事件总线 usage://updated / usage://done（每轮对话的用量事件），
 //       按会话防抖 8s 合并一轮内的事件（与官方 auto-title 相同的触发模式）。
@@ -46,7 +46,6 @@ export default function activate(ctx) {
   const READ_RETRY_DELAY_MS = 2500;
   const WRITE_RETRY = 2;
   const WRITE_RETRY_DELAY_MS = 900;
-  const NAMED_LIMIT = 800;
   const MAX_CONCURRENT = 2;
   const QUEUE_LIMIT = 8;
   const DEBOUNCE_LIMIT = 64;   // 防抖表容量上限（正常只会有个位数会话在等）
@@ -77,7 +76,9 @@ function run(p) {
       else {
         var u = db.prepare("SELECT text FROM session_messages WHERE engine = ? AND session_id = ? AND role = 'user' ORDER BY id ASC LIMIT 1").get(p.engine, p.sessionId);
         var a = db.prepare("SELECT text FROM session_messages WHERE engine = ? AND session_id = ? AND role = 'assistant' ORDER BY id ASC LIMIT 1").get(p.engine, p.sessionId);
-        out({ ok: true, exists: true, hasCustom: row.custom_title != null, messageCount: row.message_count | 0,
+        out({ ok: true, exists: true, hasCustom: row.custom_title != null,
+              customTitle: row.custom_title == null ? null : String(row.custom_title),
+              messageCount: row.message_count | 0,
               workspacePath: row.workspace_path || '', title: row.title || '',
               firstUser: u ? String(u.text || '') : '', firstAssistant: a ? String(a.text || '') : '' });
       }
@@ -85,7 +86,21 @@ function run(p) {
     } else if (p.cmd === 'write') {
       var db2 = new sqlite.DatabaseSync(dbPath());
       db2.exec('PRAGMA busy_timeout = 6000;');
-      var r = db2.prepare('UPDATE sessions SET custom_title = ? WHERE engine = ? AND session_id = ?').run(p.title, p.engine, p.sessionId);
+      // expectedCustomTitle：显式给出时做「仅当标题仍是这个值」的比较写入（自动任务的保守策略）；
+      // 缺省/undefined 时无条件覆盖（手动任务）。注意不能用 undefined 去 bind——node:sqlite
+      // 会直接抛 「Provided value cannot be bound」，而 null 是合法值（= 写「当前没有自定义标题」）。
+      var sql2 = 'UPDATE sessions SET custom_title = ? WHERE engine = ? AND session_id = ?';
+      var args2 = [p.title, p.engine, p.sessionId];
+      if ('expectedCustomTitle' in p) {
+        sql2 += ' AND custom_title IS ?';
+        args2.push(p.expectedCustomTitle === null ? null : String(p.expectedCustomTitle));
+      }
+      // 注意：run() 是绑定到 statement 对象上的方法，必须用展开调用——
+      // run.apply(null, args) 会报 "Illegal invocation"（node:sqlite 检查 receiver）。
+      var stmt2 = db2.prepare(sql2);
+      var r = args2.length === 4
+        ? stmt2.run(args2[0], args2[1], args2[2], args2[3])
+        : stmt2.run(args2[0], args2[1], args2[2]);
       out({ ok: true, updated: r.changes });
       try { db2.close(); } catch (_) {}
     } else if (p.cmd === 'clear') {
@@ -120,7 +135,6 @@ function run(p) {
   let disposed = false;
 
   let config = Object.assign({}, DEFAULT_CONFIG);
-  let named = {};            // 'engine/sessionId' -> { t, ts }
   let lastError = null;      // { msg, ts } —— 状态栏 ⚠ + 设置页
   let flash = null;          // { text, error, until } —— 状态栏短暂提示
   let testResult = null;     // 设置页「测试」结果
@@ -136,6 +150,8 @@ function run(p) {
   const debounceTimers = new Map(); // key -> timer id（LRU：先删最早的 key）
   const queuedKeys = new Set();
   const inflightKeys = new Set();
+  const inflightManualKeys = new Set();
+  const pendingManualKeys = new Set();
   const queue = [];          // { engine, sessionId, manual }
   let activeJobs = 0;
 
@@ -228,7 +244,7 @@ function run(p) {
     notify();
   }
 
-  /* ---------- 持久化（配置 / 命名记录） ---------- */
+  /* ---------- 持久化配置 ---------- */
 
   function sanitizeConfig(raw) {
     const c = Object.assign({}, DEFAULT_CONFIG);
@@ -247,23 +263,22 @@ function run(p) {
     try {
       const c = await ctx.storage.get('config');
       if (c) config = sanitizeConfig(c);
-      const n = await ctx.storage.get('named');
-      if (n && typeof n === 'object' && !Array.isArray(n)) {
-        const clean = {};
-        for (const k of Object.keys(n)) {
-          const v = n[k];
-          if (v && typeof v === 'object' && typeof v.t === 'string') clean[k] = { t: v.t, ts: v.ts || 0 };
-        }
-        named = clean;
-      }
     } catch (err) { log('读取配置失败: ' + errMsg(err)); }
+    // 0.4.3 起「命名过就不再动」改为「有 custom_title 就不再动」，named 键不再使用；
+    // 清掉旧版本留下的孤儿数据（写入空对象；storage 只有 get/set）。
+    try {
+      const legacy = await ctx.storage.get('named');
+      if (legacy && typeof legacy === 'object' && Object.keys(legacy).length > 0) {
+        await ctx.storage.set('named', {});
+        log('已清理旧版命名记录（' + Object.keys(legacy).length + ' 条）');
+      }
+    } catch (err) { log('清理旧版命名记录失败: ' + errMsg(err)); }
     try {
       const loc = await ctx.documentStorage.getLocation();
       logPath = loc && loc.path ? loc.path : null;
     } catch (_) {}
     log('已启动 mode=' + config.mode + ' engine=' + (config.engine || '(跟随会话)') +
         ' model=' + (config.model || '(默认)') + ' think=' + config.think +
-        ' 命名记录=' + Object.keys(named).length +
         (logPath ? ' 日志=' + logPath : ''));
     notify();
   }
@@ -275,21 +290,6 @@ function run(p) {
       saveConfigTimer = null;
       ctx.storage.set('config', config).catch((e) => log('保存配置失败: ' + errMsg(e)));
     }, 250);
-  }
-
-  function markNamed(key, title) {
-    named[key] = { t: title, ts: Date.now() };
-    const keys = Object.keys(named);
-    if (keys.length > NAMED_LIMIT) {
-      for (let i = 0; i < keys.length - NAMED_LIMIT; i++) delete named[keys[i]];
-    }
-    ctx.storage.set('named', named).catch(() => {});
-  }
-  function forgetNamed(key) {
-    if (named[key]) {
-      delete named[key];
-      ctx.storage.set('named', named).catch(() => {});
-    }
   }
 
   /* ---------- plugin_exec_run 包装（跟踪 in-flight 调用，停用时能 kill） ----------
@@ -681,7 +681,18 @@ function run(p) {
   function enqueue(engine, sessionId, manual) {
     if (disposed) return;
     const key = engine + '/' + sessionId;
-    if (inflightKeys.has(key)) return;
+    if (inflightKeys.has(key)) {
+      if (manual && !inflightManualKeys.has(key)) {
+        pendingManualKeys.add(key);
+        log('手动重命名等待当前任务 ' + engine + '/' + shortId(sessionId));
+        setFlash('当前任务结束后开始重新命名…', false);
+      } else if (manual) {
+        // 同一会话已经有一次手动任务在跑：AI 最坏要 30s，用户完全可能再点一次。
+        log('手动重命名已在进行中，忽略重复触发 ' + engine + '/' + shortId(sessionId));
+        setFlash('该会话正在命名中…', false);
+      }
+      return;
+    }
     if (queuedKeys.has(key)) {
       if (manual) {
         for (const q of queue) { if (q.engine === engine && q.sessionId === sessionId) q.manual = true; }
@@ -700,6 +711,19 @@ function run(p) {
     pump();
   }
 
+  function finishJob(job, key, err) {
+    activeJobs--;
+    inflightKeys.delete(key);
+    inflightManualKeys.delete(key);
+    if (err) fail(err, '命名 ' + job.engine + '/' + shortId(job.sessionId));
+    notify();
+
+    // 有副作用（清待办）的调用单独一行：停用后也要把待办清掉，只是不再入队。
+    const wantedManual = pendingManualKeys.delete(key);
+    if (wantedManual && !disposed) enqueue(job.engine, job.sessionId, true);
+    else pump();
+  }
+
   function pump() {
     if (disposed) return;
     while (activeJobs < MAX_CONCURRENT && queue.length > 0) {
@@ -707,31 +731,18 @@ function run(p) {
       const key = job.engine + '/' + job.sessionId;
       queuedKeys.delete(key);
       activeJobs++;
-      // 入队到真正开始之间，会话可能已被手动改名或已在别处跑完；再查一次，
-      // 否则在函数里提前 return 时 key 会留在 inflightKeys 里变成「永远在跑」。
-      if (named[key]) { activeJobs--; continue; }
+      // 自动任务和手动任务都在 runNaming 里重读数据库，按当前标题决定是否写入。
       inflightKeys.add(key);
+      if (job.manual) inflightManualKeys.add(key);
       notify();
       runNaming(job.engine, job.sessionId, job.manual)
-        .then(() => {
-          activeJobs--;
-          inflightKeys.delete(key);
-          notify();
-          pump();
-        })
-        .catch((err) => {
-          activeJobs--;
-          inflightKeys.delete(key);
-          fail(err, '命名 ' + job.engine + '/' + shortId(job.sessionId));
-          notify();
-          pump();
-        });
+        .then(() => finishJob(job, key))
+        .catch((err) => finishJob(job, key, err));
     }
   }
 
   async function runNaming(engine, sessionId, manual) {
     if (disposed) return;
-    const key = engine + '/' + sessionId;
 
     // 1) 读会话（索引可能滞后，重试）
     let info = null;
@@ -750,10 +761,7 @@ function run(p) {
     log('读取 ' + engine + '/' + shortId(sessionId) + ' msgs=' + info.messageCount +
         ' custom=' + info.hasCustom + ' 首条=' + clipText(String(info.firstUser || '').replace(/\s+/g, ' '), 40));
 
-    if (!manual) {
-      if (info.hasCustom) { log('跳过：已有自定义标题'); return; }
-      if (named[key]) { log('跳过：命名记录中'); return; }
-    }
+    if (!manual && info.hasCustom) { log('跳过：已有自定义标题'); return; }
     if (!info.firstUser && !info.title) { log('跳过：无素材'); return; }
 
     // 2) 生成标题
@@ -778,24 +786,38 @@ function run(p) {
     }
 
     // 3) 写 custom_title（一次重试应对短暂锁库）
+    // 自动任务走 CAS：从「读」到「写」之间标题若被改动（用户改名 / 官方 auto-title /
+    // 另一个窗口写库），放弃本次结果，避免覆盖用户意图。
+    // 手动任务是无条件覆盖：用户明确点了「AI 重新起名」，期望的就是用新结果替换当前标题，
+    // 所以他在这 30s 窗口里的任何改动都不该让这次点击静默失效。
     let written = null;
+    let missCount = 0;
     for (let attempt = 0; attempt < WRITE_RETRY && !disposed; attempt++) {
       if (attempt > 0) await sleep(WRITE_RETRY_DELAY_MS);
       try {
-        const w = await worker({ cmd: 'write', engine, sessionId, title }, WRITE_TIMEOUT_MS);
-        if (w.updated === 0) { log('写入命中 0 行（会话行已消失）'); return; }
+        const payload = { cmd: 'write', engine, sessionId, title };
+        if (!manual) payload.expectedCustomTitle = info.customTitle;
+        const w = await worker(payload, WRITE_TIMEOUT_MS);
+        if (w.updated === 0) { missCount++; continue; }
         written = w;
         break;
       } catch (err) {
         if (attempt === WRITE_RETRY - 1) throw err;
       }
     }
+    if (!written) {
+      if (missCount > 0) {
+        // 会话行很可能已消失；手动操作必须让用户看到结果，不能只写一行日志。
+        log('写入未命中（会话已消失或标题已变化）manual=' + manual);
+        if (manual) setFlash('未写入：会话已消失或标题已被改动，请重试', true);
+      }
+      return;
+    }
     if (disposed || !written) return;
     log('写入成功 "' + title + '"');
 
-    // 4) 刷新侧栏 + 记录
+    // 4) 刷新侧栏 + 状态反馈
     try { await ctx.sessions.refresh(); } catch (e) { log('refresh 失败: ' + errMsg(e)); }
-    markNamed(key, title);
     clearError();
     setFlash('已命名：' + title, false);
   }
@@ -808,14 +830,13 @@ function run(p) {
     if (!e.engine || !e.sessionId) return;
     if (config.mode === 'off') return;
     const key = e.engine + '/' + e.sessionId;
-    if (named[key] || inflightKeys.has(key) || queuedKeys.has(key)) return;
+    if (inflightKeys.has(key) || queuedKeys.has(key)) return;
 
     const prev = debounceTimers.get(key);
     if (prev) clearDebounce(key);
     const id = addTimer(() => {
       debounceTimers.delete(key);
       if (disposed || config.mode === 'off') return;
-      if (named[key]) return;
       enqueue(e.engine, e.sessionId, false);
     }, DEBOUNCE_MS);
     setDebounce(key, id);
@@ -878,8 +899,13 @@ function run(p) {
     run: (target) => {
       if (!target || !target.engine || !target.sessionId) return;
       const key = target.engine + '/' + target.sessionId;
+      // 先撤销这个会话还挂着的自动命名（防抖里）与排队中的手动重命名，否则用户刚清掉的
+      // 标题会在几秒后被 AI 名字重新占掉，而且没有任何提示。
+      const hadPending = pendingManualKeys.delete(key);
+      clearDebounce(key);
+      if (hadPending) log('恢复默认标题：撤销排队中的手动重命名 ' + shortId(target.sessionId));
       worker({ cmd: 'clear', engine: target.engine, sessionId: target.sessionId }, WRITE_TIMEOUT_MS)
-        .then(() => { forgetNamed(key); return ctx.sessions.refresh(); })
+        .then(() => ctx.sessions.refresh())
         .then(() => { clearError(); setFlash('已恢复默认标题', false); })
         .catch((err) => fail(err, '恢复默认标题'));
     },
@@ -978,15 +1004,7 @@ function run(p) {
         .then(() => { log('测试：' + steps.join(' | ')); notify(); });
     };
 
-    const clearNamed = () => {
-      named = {};
-      ctx.storage.set('named', named).catch(() => {});
-      setFlash('已清除命名记录，后续轮次会重新命名', false);
-      notify();
-    };
-
     const busy = activeJobs > 0 || queue.length > 0;
-    const namedCount = Object.keys(named).length;
 
     const modeSeg = h('div', { style: rowStyle },
       h('span', { style: labelStyle }, '命名方式'),
@@ -1099,13 +1117,6 @@ function run(p) {
         : null
     );
 
-    const namedRow = h('div', { style: rowStyle },
-      h('span', { style: labelStyle }, '命名记录'),
-      h('span', { style: hintStyle }, '已命名 ' + namedCount + ' 个会话'),
-      h('button', { style: btnStyle, onClick: clearNamed, disabled: namedCount === 0 }, '清除记录'),
-      h('span', { style: hintStyle }, '清除后，这些会话下一轮会重新命名')
-    );
-
     const logRow = h('div', null,
       h('div', { style: rowStyle },
         h('span', { style: labelStyle }, '调试日志'),
@@ -1115,7 +1126,7 @@ function run(p) {
     );
 
     const intro = h('p', { style: Object.assign({}, hintStyle, { marginTop: 0 }) },
-      '每轮对话结束 8 秒后自动为会话生成简短标题，并带上一个贴合主题的 emoji 前缀（可在下方关闭；不覆盖手动改名）。失败会在右下角状态栏提示，原因与全过程见上方日志。'
+      '每轮对话结束 8 秒后自动为会话生成简短标题，并带上一个贴合主题的 emoji 前缀（可在下方关闭；自动命名不会覆盖已有自定义标题，手动重新命名会覆盖当前标题）。失败会在右下角状态栏提示，原因与全过程见上方日志。'
     );
 
     const showAiRows = config.mode === 'ai';
@@ -1131,7 +1142,6 @@ function run(p) {
       lenRow,
       statusRow,
       testRow,
-      namedRow,
       logRow
     );
   }
@@ -1155,6 +1165,8 @@ function run(p) {
     queue.length = 0;
     queuedKeys.clear();
     inflightKeys.clear();
+    inflightManualKeys.clear();
+    pendingManualKeys.clear();
     debounceTimers.clear();
     listeners.clear();
     disposeUpdated();

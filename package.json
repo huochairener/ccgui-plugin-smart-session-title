@@ -1,0 +1,14 @@
+{
+  "name": "ccgui-plugin-smart-session-title",
+  "version": "0.4.3",
+  "private": true,
+  "type": "module",
+  "description": "CC GUI 插件：智能会话命名（免构建单文件 ESM，main.js 即产物）",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}
